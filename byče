@@ -1,0 +1,540 @@
+package cz.freeorders;
+
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import net.milkbowl.vault.economy.Economy;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandExecutor;
+import org.bukkit.command.CommandSender;
+import org.bukkit.command.TabCompleter;
+import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.InventoryDragEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.Material;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.PlayerInventory;
+import org.bukkit.plugin.RegisteredServiceProvider;
+import org.bukkit.plugin.java.JavaPlugin;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
+public class FreeOrders extends JavaPlugin implements CommandExecutor, TabCompleter, Listener {
+
+    // ---- simple limits, change them here if you want ----
+    public static final int MAX_AMOUNT = 2304;            // max items in one order
+    public static final double MAX_PRICE = 1_000_000_000d; // max price per item
+    public static final int MAX_ORDERS_PER_PLAYER = 5;
+
+    private Economy eco;
+    private final Map<Integer, Order> orders = new LinkedHashMap<>();
+    private int nextId = 1;
+    private File dataFile;
+
+    @Override
+    public void onEnable() {
+        RegisteredServiceProvider<Economy> rsp =
+                getServer().getServicesManager().getRegistration(Economy.class);
+        if (rsp == null) {
+            getLogger().severe("No Vault economy found! Install Vault + EssentialsX.");
+            getServer().getPluginManager().disablePlugin(this);
+            return;
+        }
+        eco = rsp.getProvider();
+        dataFile = new File(getDataFolder(), "orders.yml");
+        load();
+        getCommand("order").setExecutor(this);
+        getCommand("order").setTabCompleter(this);
+        getServer().getPluginManager().registerEvents(this, this);
+    }
+
+    @Override
+    public void onDisable() {
+        if (eco != null) save();
+    }
+
+    public Collection<Order> getOrders() {
+        return orders.values();
+    }
+
+    public String money(double amount) {
+        return eco.format(amount);
+    }
+
+    private void msg(Player p, String text, NamedTextColor color) {
+        p.sendMessage(Component.text("[Orders] ", NamedTextColor.GOLD)
+                .append(Component.text(text, color)));
+    }
+
+    // ------------------------------------------------------------------ commands
+
+    @Override
+    public boolean onCommand(CommandSender sender, Command cmd, String label, String[] a) {
+        if (!(sender instanceof Player p)) {
+            sender.sendMessage("Players only.");
+            return true;
+        }
+        if (!p.hasPermission("freeorders.use")) {
+            msg(p, "You don't have permission.", NamedTextColor.RED);
+            return true;
+        }
+        if (a.length == 0) {
+            OrderMenu.open(this, p, OrderMenu.Mode.ALL, 0);
+            return true;
+        }
+        switch (a[0].toLowerCase()) {
+            case "my" -> OrderMenu.open(this, p, OrderMenu.Mode.MY, 0);
+            case "create" -> {
+                if (a.length < 3) {
+                    msg(p, "Usage: /order create <amount> <price per item>  (hold the item in your hand)",
+                            NamedTextColor.RED);
+                    return true;
+                }
+                int amount;
+                double price;
+                try {
+                    amount = Integer.parseInt(a[1]);
+                    price = Double.parseDouble(a[2]);
+                } catch (NumberFormatException ex) {
+                    msg(p, "Amount and price must be numbers.", NamedTextColor.RED);
+                    return true;
+                }
+                createOrder(p, amount, price);
+            }
+            default -> msg(p, "Usage: /order, /order my, /order create <amount> <price>",
+                    NamedTextColor.RED);
+        }
+        return true;
+    }
+
+    @Override
+    public List<String> onTabComplete(CommandSender sender, Command cmd, String label, String[] a) {
+        if (a.length == 1) return List.of("my", "create");
+        if (a.length == 2 && a[0].equalsIgnoreCase("create")) return List.of("<amount>");
+        if (a.length == 3 && a[0].equalsIgnoreCase("create")) return List.of("<price per item>");
+        return List.of();
+    }
+
+    // ------------------------------------------------------------------ order logic
+
+    private void createOrder(Player p, int amount, double price) {
+        ItemStack hand = p.getInventory().getItemInMainHand();
+        if (hand.getType().isAir()) {
+            msg(p, "Hold the item you want to order in your main hand.", NamedTextColor.RED);
+            return;
+        }
+        if (hand.hasItemMeta()) {
+            msg(p, "Only plain items can be ordered (no custom name, enchants or damage).",
+                    NamedTextColor.RED);
+            return;
+        }
+        if (amount < 1 || amount > MAX_AMOUNT) {
+            msg(p, "Amount must be between 1 and " + MAX_AMOUNT + ".", NamedTextColor.RED);
+            return;
+        }
+        if (!Double.isFinite(price) || price <= 0 || price > MAX_PRICE) {
+            msg(p, "Invalid price.", NamedTextColor.RED);
+            return;
+        }
+        long count = orders.values().stream()
+                .filter(o -> o.owner.equals(p.getUniqueId())).count();
+        if (count >= MAX_ORDERS_PER_PLAYER) {
+            msg(p, "You can have at most " + MAX_ORDERS_PER_PLAYER + " orders.", NamedTextColor.RED);
+            return;
+        }
+
+        double total = amount * price;
+        if (!eco.has(p, total)) {
+            msg(p, "You need " + money(total) + " to create this order.", NamedTextColor.RED);
+            return;
+        }
+        if (!eco.withdrawPlayer(p, total).transactionSuccess()) {
+            msg(p, "Payment failed.", NamedTextColor.RED);
+            return;
+        }
+
+        Order o = new Order(nextId++, p.getUniqueId(), p.getName(), hand.getType(), amount, 0, price);
+        orders.put(o.id, o);
+        save();
+        msg(p, "Order created: " + amount + "x " + OrderMenu.pretty(o.material)
+                + " for " + money(price) + " each. " + money(total) + " was held in escrow.",
+                NamedTextColor.GREEN);
+    }
+
+    private static boolean matches(ItemStack it, Material mat) {
+        return it != null && it.getType() == mat && !it.hasItemMeta();
+    }
+
+    private void fulfill(Player p, Order o) {
+        if (o.owner.equals(p.getUniqueId())) {
+            msg(p, "You can't fill your own order.", NamedTextColor.RED);
+            return;
+        }
+        if (o.remaining <= 0) {
+            msg(p, "This order is already complete.", NamedTextColor.RED);
+            return;
+        }
+        PlayerInventory inv = p.getInventory();
+        ItemStack[] contents = inv.getStorageContents();
+
+        int have = 0;
+        for (ItemStack it : contents) {
+            if (matches(it, o.material)) have += it.getAmount();
+        }
+        int take = Math.min(have, o.remaining);
+        if (take <= 0) {
+            msg(p, "You don't have any " + OrderMenu.pretty(o.material) + " (plain items only).",
+                    NamedTextColor.RED);
+            return;
+        }
+
+        int need = take;
+        for (int i = 0; i < contents.length && need > 0; i++) {
+            ItemStack it = contents[i];
+            if (!matches(it, o.material)) continue;
+            int rem = Math.min(need, it.getAmount());
+            if (rem == it.getAmount()) {
+                contents[i] = null;
+            } else {
+                it.setAmount(it.getAmount() - rem);
+            }
+            need -= rem;
+        }
+        inv.setStorageContents(contents);
+
+        double pay = take * o.price;
+        eco.depositPlayer(p, pay);
+        o.remaining -= take;
+        o.delivered += take;
+        save();
+
+        msg(p, "Delivered " + take + "x " + OrderMenu.pretty(o.material)
+                + " and received " + money(pay) + ".", NamedTextColor.GREEN);
+
+        Player owner = getServer().getPlayer(o.owner);
+        if (owner != null) {
+            msg(owner, p.getName() + " delivered " + take + "x " + OrderMenu.pretty(o.material)
+                    + ". Use /order my to collect.", NamedTextColor.AQUA);
+        }
+    }
+
+    private void collect(Player p, Order o) {
+        if (!o.owner.equals(p.getUniqueId())) return;
+        if (o.delivered <= 0) {
+            msg(p, "Nothing to collect yet.", NamedTextColor.RED);
+            return;
+        }
+        int before = o.delivered;
+        while (o.delivered > 0) {
+            int n = Math.min(o.delivered, o.material.getMaxStackSize());
+            Map<Integer, ItemStack> left = p.getInventory().addItem(new ItemStack(o.material, n));
+            int notFit = left.values().stream().mapToInt(ItemStack::getAmount).sum();
+            o.delivered -= (n - notFit);
+            if (notFit > 0) {
+                msg(p, "Your inventory is full.", NamedTextColor.RED);
+                break;
+            }
+        }
+        int got = before - o.delivered;
+        if (o.remaining <= 0 && o.delivered <= 0) orders.remove(o.id);
+        save();
+        if (got > 0) {
+            msg(p, "Collected " + got + "x " + OrderMenu.pretty(o.material) + ".", NamedTextColor.GREEN);
+        }
+    }
+
+    private void cancel(Player p, Order o) {
+        if (!o.owner.equals(p.getUniqueId())) return;
+        double refund = o.remaining * o.price;
+        if (refund > 0) eco.depositPlayer(p, refund);
+        o.remaining = 0;
+        if (o.delivered <= 0) orders.remove(o.id);
+        save();
+        msg(p, "Order cancelled. Refunded " + money(refund) + "."
+                + (o.delivered > 0 ? " Collect the delivered items with left click." : ""),
+                NamedTextColor.YELLOW);
+    }
+
+    // ------------------------------------------------------------------ menu events
+
+    @EventHandler
+    public void onClick(InventoryClickEvent e) {
+        if (!(e.getView().getTopInventory().getHolder() instanceof OrderMenu menu)) return;
+        e.setCancelled(true);
+        if (e.getClickedInventory() != e.getView().getTopInventory()) return;
+        if (!(e.getWhoClicked() instanceof Player p)) return;
+
+        int slot = e.getSlot();
+
+        if (slot == 45 && menu.page > 0) {
+            reopen(p, menu.mode, menu.page - 1);
+            return;
+        }
+        if (slot == 53 && menu.hasNext) {
+            reopen(p, menu.mode, menu.page + 1);
+            return;
+        }
+        if (slot == 49) {
+            reopen(p, menu.mode == OrderMenu.Mode.ALL ? OrderMenu.Mode.MY : OrderMenu.Mode.ALL, 0);
+            return;
+        }
+
+        Order shown = menu.slotOrders.get(slot);
+        if (shown == null) return;
+        Order live = orders.get(shown.id);
+        if (live == null) {
+            reopen(p, menu.mode, menu.page);
+            return;
+        }
+
+        if (menu.mode == OrderMenu.Mode.ALL) {
+            fulfill(p, live);
+        } else if (e.isRightClick()) {
+            cancel(p, live);
+        } else {
+            collect(p, live);
+        }
+        reopen(p, menu.mode, menu.page);
+    }
+
+    @EventHandler
+    public void onDrag(InventoryDragEvent e) {
+        if (e.getView().getTopInventory().getHolder() instanceof OrderMenu) {
+            e.setCancelled(true);
+        }
+    }
+
+    @EventHandler
+    public void onJoin(PlayerJoinEvent e) {
+        Player p = e.getPlayer();
+        boolean pending = orders.values().stream()
+                .anyMatch(o -> o.owner.equals(p.getUniqueId()) && o.delivered > 0);
+        if (pending) {
+            msg(p, "You have delivered items waiting. Use /order my to collect.", NamedTextColor.AQUA);
+        }
+    }
+
+    private void reopen(Player p, OrderMenu.Mode mode, int page) {
+        getServer().getScheduler().runTask(this, () -> OrderMenu.open(this, p, mode, page));
+    }
+
+    // ------------------------------------------------------------------ storage
+
+    private void load() {
+        if (!dataFile.exists()) return;
+        YamlConfiguration cfg = YamlConfiguration.loadConfiguration(dataFile);
+        nextId = cfg.getInt("next", 1);
+        ConfigurationSection sec = cfg.getConfigurationSection("orders");
+        if (sec == null) return;
+        for (String key : sec.getKeys(false)) {
+            ConfigurationSection s = sec.getConfigurationSection(key);
+            if (s == null) continue;
+            Material m = Material.matchMaterial(s.getString("material", ""));
+            String ownerStr = s.getString("owner");
+            if (m == null || ownerStr == null) continue;
+            Order o = new Order(Integer.parseInt(key), UUID.fromString(ownerStr),
+                    s.getString("ownerName", "?"), m,
+                    s.getInt("remaining"), s.getInt("delivered"), s.getDouble("price"));
+            orders.put(o.id, o);
+        }
+    }
+
+    private void save() {
+        YamlConfiguration cfg = new YamlConfiguration();
+        cfg.set("next", nextId);
+        for (Order o : orders.values()) {
+            String b = "orders." + o.id + ".";
+            cfg.set(b + "owner", o.owner.toString());
+            cfg.set(b + "ownerName", o.ownerName);
+            cfg.set(b + "material", o.material.name());
+            cfg.set(b + "remaining", o.remaining);
+            cfg.set(b + "delivered", o.delivered);
+            cfg.set(b + "price", o.price);
+        }
+        try {
+            getDataFolder().mkdirs();
+            cfg.save(dataFile);
+        } catch (IOException ex) {
+            getLogger().severe("Could not save orders.yml: " + ex.getMessage());
+        }
+    }
+}
+
+package cz.freeorders;
+
+import org.bukkit.Material;
+
+import java.util.UUID;
+
+public class Order {
+    public final int id;
+    public final UUID owner;
+    public final String ownerName;
+    public final Material material;
+    public int remaining;    // how many items are still wanted
+    public int delivered;    // delivered by others, waiting for the owner to collect
+    public final double price; // price per item
+
+    public Order(int id, UUID owner, String ownerName, Material material,
+                 int remaining, int delivered, double price) {
+        this.id = id;
+        this.owner = owner;
+        this.ownerName = ownerName;
+        this.material = material;
+        this.remaining = remaining;
+        this.delivered = delivered;
+        this.price = price;
+    }
+}
+
+package cz.freeorders;
+
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import net.kyori.adventure.text.format.TextDecoration;
+import org.bukkit.Bukkit;
+import org.bukkit.Material;
+import org.bukkit.entity.Player;
+import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.InventoryHolder;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ItemMeta;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public class OrderMenu implements InventoryHolder {
+
+    public enum Mode { ALL, MY }
+
+    public static final int PAGE_SIZE = 45;
+
+    public final Mode mode;
+    public int page;
+    public boolean hasNext;
+    public final Map<Integer, Order> slotOrders = new HashMap<>();
+    private Inventory inv;
+
+    private OrderMenu(Mode mode) {
+        this.mode = mode;
+    }
+
+    @Override
+    public Inventory getInventory() {
+        return inv;
+    }
+
+    static Component line(String text, NamedTextColor color) {
+        return Component.text(text, color).decoration(TextDecoration.ITALIC, false);
+    }
+
+    public static String pretty(Material m) {
+        StringBuilder sb = new StringBuilder();
+        for (String w : m.name().toLowerCase().split("_")) {
+            if (w.isEmpty()) continue;
+            if (sb.length() > 0) sb.append(' ');
+            sb.append(Character.toUpperCase(w.charAt(0))).append(w.substring(1));
+        }
+        return sb.toString();
+    }
+
+    private static ItemStack named(Material mat, String name, NamedTextColor color) {
+        ItemStack it = new ItemStack(mat);
+        ItemMeta meta = it.getItemMeta();
+        meta.displayName(line(name, color));
+        it.setItemMeta(meta);
+        return it;
+    }
+
+    public static void open(FreeOrders plugin, Player p, Mode mode, int page) {
+        OrderMenu m = new OrderMenu(mode);
+
+        List<Order> list = new ArrayList<>();
+        for (Order o : plugin.getOrders()) {
+            boolean show = (mode == Mode.ALL) ? o.remaining > 0 : o.owner.equals(p.getUniqueId());
+            if (show) list.add(o);
+        }
+        list.sort(Comparator.comparingInt((Order o) -> o.id).reversed());
+
+        int maxPage = Math.max(0, (list.size() - 1) / PAGE_SIZE);
+        m.page = Math.max(0, Math.min(page, maxPage));
+        int from = m.page * PAGE_SIZE;
+        int to = Math.min(list.size(), from + PAGE_SIZE);
+        m.hasNext = to < list.size();
+
+        m.inv = Bukkit.createInventory(m, 54,
+                Component.text(mode == Mode.ALL ? "Orders" : "My Orders"));
+
+        for (int i = from; i < to; i++) {
+            Order o = list.get(i);
+            int slot = i - from;
+            m.slotOrders.put(slot, o);
+            m.inv.setItem(slot, icon(plugin, o, mode));
+        }
+
+        ItemStack filler = named(Material.BLACK_STAINED_GLASS_PANE, " ", NamedTextColor.GRAY);
+        for (int s = 45; s < 54; s++) m.inv.setItem(s, filler);
+        if (m.page > 0) m.inv.setItem(45, named(Material.ARROW, "Previous page", NamedTextColor.YELLOW));
+        if (m.hasNext) m.inv.setItem(53, named(Material.ARROW, "Next page", NamedTextColor.YELLOW));
+        m.inv.setItem(49, mode == Mode.ALL
+                ? named(Material.CHEST, "My orders", NamedTextColor.GREEN)
+                : named(Material.COMPASS, "All orders", NamedTextColor.GREEN));
+
+        p.openInventory(m.inv);
+    }
+
+    private static ItemStack icon(FreeOrders plugin, Order o, Mode mode) {
+        int shown = Math.max(1, Math.min(o.remaining, o.material.getMaxStackSize()));
+        ItemStack it = new ItemStack(o.material, shown);
+        ItemMeta meta = it.getItemMeta();
+        meta.displayName(line(pretty(o.material), NamedTextColor.WHITE));
+
+        List<Component> lore = new ArrayList<>();
+        lore.add(line("Buyer: " + o.ownerName, NamedTextColor.GRAY));
+        lore.add(line("Price each: " + plugin.money(o.price), NamedTextColor.GOLD));
+        if (mode == Mode.ALL) {
+            lore.add(line("Wanted: " + o.remaining, NamedTextColor.YELLOW));
+            lore.add(Component.empty());
+            lore.add(line("Click to deliver items from your inventory", NamedTextColor.GREEN));
+        } else {
+            lore.add(line("Still wanted: " + o.remaining, NamedTextColor.YELLOW));
+            lore.add(line("Delivered (to collect): " + o.delivered, NamedTextColor.AQUA));
+            lore.add(Component.empty());
+            lore.add(line("Left click: collect items", NamedTextColor.GREEN));
+            lore.add(line("Right click: cancel + refund", NamedTextColor.RED));
+        }
+        meta.lore(lore);
+        it.setItemMeta(meta);
+        return it;
+    }
+}
+
+name: FreeOrders
+version: 1.0.0
+main: cz.freeorders.FreeOrders
+api-version: '1.21'
+description: Player-driven buy order board (/order), DonutSMP style
+depend: [Vault]
+softdepend: [EssentialsX]
+commands:
+  order:
+    description: Open the order board
+    usage: /order [my|create <amount> <price>]
+    aliases: [orders]
+permissions:
+  freeorders.use:
+    description: Allows using /order
+    default: true
